@@ -57,6 +57,12 @@ const toolResultImagePlaceholder = "[Tool returned an image; the image is attach
 // leave room for headers and minor serialization overhead.
 const maxPayloadBytes = 900 * 1024
 
+// payloadHistoryWindowShare reserves half of the model window for the current
+// instruction, tool schemas/results, and output headroom. This applies to Kiro
+// history produced directly from a client request, not only stored Responses
+// replay, because Codex can resend prior tool output inline.
+const payloadHistoryWindowShare = 0.5
+
 // truncationPlaceholder is inserted in history where older turns were dropped to
 // fit within maxPayloadBytes.
 const truncationPlaceholder = "[Earlier conversation history was truncated to fit the model's input limit. Older messages and tool activity have been omitted.]"
@@ -64,6 +70,10 @@ const truncationPlaceholder = "[Earlier conversation history was truncated to fi
 // toolResultTruncationMarker makes lossy tool-output trimming explicit while
 // preserving the result's head, tail, call ID, and structured pairing.
 const toolResultTruncationMarker = "\n...[Tool output truncated to fit the model input limit]...\n"
+
+// historyContentTruncationMarker is used only when a retained recent history
+// entry is individually too large to fit, so its position and role stay intact.
+const historyContentTruncationMarker = "\n...[Earlier message content truncated to fit the model input limit]...\n"
 
 // minRecentHistoryTurns is the number of most-recent history entries always kept
 // (in addition to system priming and the active tool turn) when truncating.
@@ -1756,6 +1766,13 @@ func truncatePayloadToLimit(payload *KiroPayload, hasPriming bool) {
 	if payload == nil {
 		return
 	}
+
+	// Byte size alone is not a reliable context limit: source code, JSON, and
+	// command output can tokenize densely. Cap inline history by the model window
+	// even when the serialized request is below maxPayloadBytes.
+	historyTokenLimit := int(float64(getContextWindowSize(currentMessageModelID(payload))) * payloadHistoryWindowShare)
+	truncateHistoryContentToTokenLimit(payload, historyTokenLimit)
+
 	if payloadByteSize(payload) <= maxPayloadBytes {
 		return
 	}
@@ -1815,6 +1832,14 @@ func truncatePayloadToLimit(payload *KiroPayload, hasPriming bool) {
 	rebuilt = append(rebuilt, tail...)
 	payload.ConversationState.History = rebuilt
 
+	// The minimum recent-turn count preserves structure, but an individual
+	// retained entry can itself be multiple megabytes (for example, a prior
+	// Codex exec result flattened into history). Shorten retained history text
+	// before touching the current turn.
+	if payloadByteSize(payload) > maxPayloadBytes {
+		truncateHistoryContentToLimit(payload, maxPayloadBytes)
+	}
+
 	// Structured current tool results are outside current-message content and
 	// can dominate the payload (Codex exec output commonly exceeds 1 MB). Trim
 	// their text first so the user's current instruction remains intact.
@@ -1859,6 +1884,145 @@ func payloadByteSize(payload *KiroPayload) int {
 
 func currentMessageModelID(payload *KiroPayload) string {
 	return payload.ConversationState.CurrentMessage.UserInputMessage.ModelID
+}
+
+func estimateKiroHistoryTokens(history []KiroHistoryMessage) int {
+	total := 0
+	for _, entry := range history {
+		if entry.UserInputMessage != nil {
+			total += estimateApproxTokens(entry.UserInputMessage.Content)
+			if ctx := entry.UserInputMessage.UserInputMessageContext; ctx != nil {
+				for _, result := range ctx.ToolResults {
+					for _, content := range result.Content {
+						total += estimateApproxTokens(content.Text)
+					}
+				}
+				for _, tool := range ctx.Tools {
+					total += estimateApproxTokens(tool.ToolSpecification.Name)
+					total += estimateApproxTokens(tool.ToolSpecification.Description)
+					total += estimateJSONTokens(tool.ToolSpecification.InputSchema.JSON)
+				}
+			}
+		}
+		if entry.AssistantResponseMessage != nil {
+			total += estimateApproxTokens(entry.AssistantResponseMessage.Content)
+			for _, toolUse := range entry.AssistantResponseMessage.ToolUses {
+				total += estimateApproxTokens(toolUse.Name)
+				total += estimateJSONTokens(toolUse.Input)
+			}
+		}
+	}
+	return total
+}
+
+// truncateHistoryContentToTokenLimit handles dense text that can exceed Kiro's
+// context threshold while remaining below the byte cap. It keeps message
+// structure and trims only the largest retained text fields.
+func truncateHistoryContentToTokenLimit(payload *KiroPayload, tokenLimit int) {
+	if payload == nil || tokenLimit <= 0 {
+		return
+	}
+
+	for {
+		currentTokens := estimateKiroHistoryTokens(payload.ConversationState.History)
+		if currentTokens <= tokenLimit {
+			return
+		}
+
+		entryIndex, largestTokens, largestBytes, isUser := -1, 0, 0, false
+		for i := range payload.ConversationState.History {
+			entry := &payload.ConversationState.History[i]
+			if entry.UserInputMessage != nil {
+				tokens := estimateApproxTokens(entry.UserInputMessage.Content)
+				if tokens > largestTokens {
+					entryIndex, largestTokens, largestBytes, isUser = i, tokens, len(entry.UserInputMessage.Content), true
+				}
+			}
+			if entry.AssistantResponseMessage != nil {
+				tokens := estimateApproxTokens(entry.AssistantResponseMessage.Content)
+				if tokens > largestTokens {
+					entryIndex, largestTokens, largestBytes, isUser = i, tokens, len(entry.AssistantResponseMessage.Content), false
+				}
+			}
+		}
+		if entryIndex < 0 || largestBytes <= len(historyContentTruncationMarker) {
+			return
+		}
+
+		targetTokens := largestTokens - (currentTokens - tokenLimit) - 64
+		if targetTokens < 1 {
+			targetTokens = 1
+		}
+		targetBytes := largestBytes * targetTokens / max(1, largestTokens)
+		if targetBytes < len(historyContentTruncationMarker) {
+			targetBytes = len(historyContentTruncationMarker)
+		}
+
+		entry := &payload.ConversationState.History[entryIndex]
+		var content *string
+		if isUser {
+			content = &entry.UserInputMessage.Content
+		} else {
+			content = &entry.AssistantResponseMessage.Content
+		}
+		trimmed := truncateTextAroundMarker(*content, targetBytes, historyContentTruncationMarker)
+		if len(trimmed) >= len(*content) {
+			trimmed = historyContentTruncationMarker
+		}
+		*content = trimmed
+	}
+}
+
+// truncateHistoryContentToLimit reduces the largest retained history text
+// fields until the complete serialized payload fits. Message roles, ordering,
+// tool-call structures, and the current user instruction remain unchanged.
+func truncateHistoryContentToLimit(payload *KiroPayload, limit int) {
+	if payload == nil || limit <= 0 {
+		return
+	}
+
+	for {
+		currentSize := payloadByteSize(payload)
+		if currentSize <= limit {
+			return
+		}
+
+		entryIndex, largestBytes, isUser := -1, 0, false
+		for i := range payload.ConversationState.History {
+			entry := &payload.ConversationState.History[i]
+			if entry.UserInputMessage != nil && len(entry.UserInputMessage.Content) > largestBytes {
+				entryIndex, largestBytes, isUser = i, len(entry.UserInputMessage.Content), true
+			}
+			if entry.AssistantResponseMessage != nil && len(entry.AssistantResponseMessage.Content) > largestBytes {
+				entryIndex, largestBytes, isUser = i, len(entry.AssistantResponseMessage.Content), false
+			}
+		}
+		if entryIndex < 0 || largestBytes <= len(historyContentTruncationMarker) {
+			return
+		}
+
+		excess := currentSize - limit
+		targetBytes := largestBytes - excess - 256
+		if targetBytes < len(historyContentTruncationMarker) {
+			targetBytes = len(historyContentTruncationMarker)
+		}
+		if targetBytes >= largestBytes {
+			targetBytes = largestBytes - 1
+		}
+
+		entry := &payload.ConversationState.History[entryIndex]
+		var content *string
+		if isUser {
+			content = &entry.UserInputMessage.Content
+		} else {
+			content = &entry.AssistantResponseMessage.Content
+		}
+		trimmed := truncateTextAroundMarker(*content, targetBytes, historyContentTruncationMarker)
+		if len(trimmed) >= len(*content) {
+			trimmed = historyContentTruncationMarker
+		}
+		*content = trimmed
+	}
 }
 
 // truncateCurrentToolResults reduces the largest structured tool outputs until
@@ -1911,21 +2075,26 @@ func truncateCurrentToolResults(payload *KiroPayload) {
 }
 
 // truncateToolResultText preserves both ends of tool output because command
-// failures and summaries often appear at the tail. Cuts always start on UTF-8
-// rune boundaries.
+// failures and summaries often appear at the tail.
 func truncateToolResultText(text string, maxBytes int) string {
+	return truncateTextAroundMarker(text, maxBytes, toolResultTruncationMarker)
+}
+
+// truncateTextAroundMarker preserves both ends of text and always cuts on
+// UTF-8 rune boundaries.
+func truncateTextAroundMarker(text string, maxBytes int, marker string) string {
 	if len(text) <= maxBytes {
 		return text
 	}
-	if maxBytes <= len(toolResultTruncationMarker) {
-		end := min(maxBytes, len(toolResultTruncationMarker))
-		for end > 0 && !utf8.ValidString(toolResultTruncationMarker[:end]) {
+	if maxBytes <= len(marker) {
+		end := min(maxBytes, len(marker))
+		for end > 0 && !utf8.ValidString(marker[:end]) {
 			end--
 		}
-		return toolResultTruncationMarker[:end]
+		return marker[:end]
 	}
 
-	remaining := maxBytes - len(toolResultTruncationMarker)
+	remaining := maxBytes - len(marker)
 	headBytes := remaining * 2 / 3
 	for headBytes > 0 && !utf8.ValidString(text[:headBytes]) {
 		headBytes--
@@ -1935,7 +2104,7 @@ func truncateToolResultText(text string, maxBytes int) string {
 	for tailStart < len(text) && !utf8.RuneStart(text[tailStart]) {
 		tailStart++
 	}
-	return text[:headBytes] + toolResultTruncationMarker + text[tailStart:]
+	return text[:headBytes] + marker + text[tailStart:]
 }
 
 // truncateCurrentMessage hard-truncates the current message content as a last
