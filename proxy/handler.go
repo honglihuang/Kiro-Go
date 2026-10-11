@@ -1310,6 +1310,18 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 			if ctx.Err() != nil {
 				return
 			}
+			if isKiroInputTooLongError(err) {
+				h.recordFailureWithDetails("claude", model, account.ID, err)
+				if !messageStarted {
+					h.sendClaudeError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+					return
+				}
+				h.sendSSE(w, flusher, "error", map[string]interface{}{
+					"type":  "error",
+					"error": map[string]string{"type": "invalid_request_error", "message": err.Error()},
+				})
+				return
+			}
 			lastErr = err
 			excluded[account.ID] = true
 			if !isStreamIntegrityError(err) {
@@ -1605,6 +1617,11 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 		err := runKiroWithIntegrityRetry(ctx, account, payload, callback, measure, reset, nil)
 		if err != nil {
 			if ctx.Err() != nil {
+				return
+			}
+			if isKiroInputTooLongError(err) {
+				h.recordFailureWithDetails("claude", model, account.ID, err)
+				h.sendClaudeError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 				return
 			}
 			lastErr = err
@@ -2091,6 +2108,19 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 			if ctx.Err() != nil {
 				return
 			}
+			if isKiroInputTooLongError(err) {
+				h.recordFailureWithDetails("openai", model, account.ID, err)
+				if !responseStarted {
+					h.sendOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+					return
+				}
+				data, _ := json.Marshal(map[string]interface{}{
+					"error": map[string]string{"message": err.Error(), "type": "invalid_request_error"},
+				})
+				fmt.Fprintf(w, "data: %s\n\n", data)
+				flusher.Flush()
+				return
+			}
 			lastErr = err
 			excluded[account.ID] = true
 			// Integrity failures are upstream hiccups, not account faults.
@@ -2232,6 +2262,11 @@ func (h *Handler) handleOpenAINonStream(ctx context.Context, w http.ResponseWrit
 		err := runKiroWithIntegrityRetry(ctx, account, payload, callback, measure, reset, nil)
 		if err != nil {
 			if ctx.Err() != nil {
+				return
+			}
+			if isKiroInputTooLongError(err) {
+				h.recordFailureWithDetails("openai", model, account.ID, err)
+				h.sendOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 				return
 			}
 			lastErr = err

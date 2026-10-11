@@ -42,6 +42,12 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 		storeResponse = *req.Store
 	}
 
+	// Resolve the model before replay expansion because the history budget is
+	// derived from the actual model's context window. A thinking suffix is a
+	// client-side convention and must not force the smallest fallback budget.
+	thinkingCfg := config.GetThinkingConfig()
+	actualModel, thinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
+
 	var historyMessages []OpenAIMessage
 	if req.PreviousResponseID != "" {
 		prev, loadErr := loadResponse(req.PreviousResponseID)
@@ -50,7 +56,7 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 				fmt.Sprintf("previous_response_id not found: %v", loadErr))
 			return
 		}
-		historyMessages = expandPreviousResponseHistory(prev)
+		historyMessages = expandPreviousResponseHistory(prev, actualModel)
 	}
 
 	inputMessages, err := parseResponsesInput(req.Input)
@@ -104,8 +110,6 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 		openaiReq.MaxTokens = *req.MaxOutputTokens
 	}
 
-	thinkingCfg := config.GetThinkingConfig()
-	actualModel, thinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
 	openaiReq.Model = actualModel
 
 	estimatedInputTokens := estimateOpenAIRequestInputTokens(openaiReq)
@@ -191,6 +195,11 @@ func (h *Handler) handleResponsesNonStream(
 		err := runKiroWithIntegrityRetry(ctx, account, payload, callback, measure, reset, nil)
 		if err != nil {
 			if ctx.Err() != nil {
+				return
+			}
+			if isKiroInputTooLongError(err) {
+				h.recordFailureWithDetails("responses", model, account.ID, err)
+				h.sendOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 				return
 			}
 			lastErr = err
@@ -545,7 +554,8 @@ func (h *Handler) handleResponsesStream(
 			if ctx.Err() != nil {
 				return
 			}
-			if !responseStarted {
+			inputTooLong := isKiroInputTooLongError(err)
+			if !responseStarted && !inputTooLong {
 				lastErr = err
 				excluded[account.ID] = true
 				// Integrity failures are upstream hiccups, not account faults.
@@ -554,13 +564,17 @@ func (h *Handler) handleResponsesStream(
 				}
 				continue
 			}
+			errorType := "server_error"
+			if inputTooLong {
+				errorType = "invalid_request_error"
+			}
 			send("response.failed", map[string]interface{}{
 				"type": "response.failed",
 				"response": map[string]interface{}{
 					"id":     respID,
 					"status": "failed",
 					"error": map[string]string{
-						"type":    "server_error",
+						"type":    errorType,
 						"message": err.Error(),
 					},
 				},

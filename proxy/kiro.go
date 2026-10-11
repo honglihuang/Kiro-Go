@@ -479,8 +479,14 @@ endpointLoop:
 			if resp.StatusCode != 200 {
 				errBody, _ := io.ReadAll(resp.Body)
 				resp.Body.Close()
-				lastErr = fmt.Errorf("HTTP %d from %s: %s", resp.StatusCode, ep.Name, string(errBody))
-				// Authentication errors and payment errors are not retried across endpoints.
+				lastErr = newKiroHTTPError(resp.StatusCode, ep.Name, errBody)
+				// Authentication, payment, and deterministic request-shape errors
+				// cannot succeed on another endpoint. In particular, retrying an
+				// oversized payload only multiplies latency and upstream load.
+				if isKiroInputTooLongError(lastErr) {
+					logger.Warnf("[KiroAPI] Endpoint %s rejected oversized input; not retrying: %v", ep.Name, lastErr)
+					return lastErr
+				}
 				if resp.StatusCode == 401 || resp.StatusCode == 403 || resp.StatusCode == 402 {
 					return lastErr
 				}

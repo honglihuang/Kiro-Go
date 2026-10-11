@@ -1,45 +1,127 @@
 package proxy
 
+import "strings"
+
 // maxResponsesHistoryDepth caps how far back we walk the previous_response_id
 // chain when expanding history. The cap prevents pathological loops in
 // corrupted/cyclic stores from running forever; legitimate chains rarely go
 // this deep within the 30-day TTL.
 const maxResponsesHistoryDepth = 64
 
-// expandPreviousResponseHistory rebuilds the conversation history that led up
-// to prev. It walks the previous_response_id chain backwards (oldest → newest)
-// and emits OpenAI messages for both stored inputs and stored outputs of every
-// ancestor, so a multi-turn /v1/responses session preserves full context.
+// replayHistoryWindowShare bounds replayed ancestor history as a fraction of the
+// model's context window, reserving the remainder for the client's current input
+// and its tool schemas.
 //
-// If a link in the chain is missing on disk (e.g. expired past TTL or the
-// referenced ID was deleted), expansion stops at the deepest reachable
-// ancestor instead of failing — the most recent context is still useful.
-func expandPreviousResponseHistory(prev *ResponsesObject) []OpenAIMessage {
+// A depth cap alone is not a size cap: 64 ancestors of full input and output can
+// exceed any window on their own. This matters when a client compacts while its
+// new request still points at the pre-compaction response. Replaying every turn
+// the client discarded would refill the context and trigger compaction again.
+const replayHistoryWindowShare = 0.5
+
+// replayTruncationNote marks where replayed ancestor turns were elided.
+const replayTruncationNote = "[Earlier turns of this conversation were omitted to fit the model's input limit.]"
+
+func maxReplayHistoryTokens(model string) int {
+	return int(float64(getContextWindowSize(model)) * replayHistoryWindowShare)
+}
+
+// expandPreviousResponseHistory rebuilds the conversation history that led up
+// to prev. It walks the previous_response_id chain backwards and emits messages
+// oldest to newest. Replayed history is bounded by a share of the model window;
+// the current request input is authoritative and is never trimmed here.
+func expandPreviousResponseHistory(prev *ResponsesObject, model string) []OpenAIMessage {
 	if prev == nil {
 		return nil
 	}
 
 	chain := collectAncestorChain(prev)
-
-	messages := make([]OpenAIMessage, 0)
+	groups := make([][]OpenAIMessage, 0, len(chain))
 	for _, node := range chain {
-		// Inject the instructions stored on the ancestor as a system message
-		// so it remains in scope for downstream turns. Without this, an early
-		// system prompt set on response A would be lost the moment a new
-		// turn omits it.
+		group := make([]OpenAIMessage, 0, 4)
 		if node.Instructions != "" {
-			messages = append(messages, OpenAIMessage{
+			group = append(group, OpenAIMessage{
 				Role:    "system",
 				Content: node.Instructions,
 			})
 		}
 		if prior, err := parseResponsesInput(node.StoredInput); err == nil {
-			messages = append(messages, prior...)
+			group = append(group, prior...)
 		}
-		messages = append(messages, outputToMessages(node.Output)...)
+		group = append(group, outputToMessages(node.Output)...)
+		groups = append(groups, group)
 	}
 
+	return flattenReplayGroups(groups, maxReplayHistoryTokens(model))
+}
+
+// flattenReplayGroups drops complete oldest turns until the newest suffix fits
+// within budget. The newest turn is retained even if it alone exceeds budget;
+// downstream payload truncation remains the final byte-level safety net.
+func flattenReplayGroups(groups [][]OpenAIMessage, budget int) []OpenAIMessage {
+	keepFrom := 0
+	if budget > 0 {
+		total := 0
+		keepFrom = len(groups)
+		for i := len(groups) - 1; i >= 0; i-- {
+			total += estimateReplayGroupTokens(groups[i])
+			if total > budget && i < len(groups)-1 {
+				break
+			}
+			keepFrom = i
+		}
+	}
+
+	messages := make([]OpenAIMessage, 0)
+	if keepFrom > 0 {
+		messages = append(messages, OpenAIMessage{
+			Role:    "user",
+			Content: replayTruncationNote,
+		})
+	}
+	for _, group := range groups[keepFrom:] {
+		messages = append(messages, group...)
+	}
+	if keepFrom > 0 {
+		messages = dropOrphanedLeadingToolMessages(messages)
+	}
 	return messages
+}
+
+// dropOrphanedLeadingToolMessages removes tool results whose assistant call was
+// in an older turn removed by replay trimming. Kiro rejects unpaired results.
+func dropOrphanedLeadingToolMessages(messages []OpenAIMessage) []OpenAIMessage {
+	seenCalls := make(map[string]bool)
+	out := make([]OpenAIMessage, 0, len(messages))
+	sawAssistantCall := false
+
+	for _, message := range messages {
+		if message.Role == "assistant" && len(message.ToolCalls) > 0 {
+			sawAssistantCall = true
+			for _, call := range message.ToolCalls {
+				if call.ID != "" {
+					seenCalls[call.ID] = true
+				}
+			}
+		}
+		if message.Role == "tool" && !sawAssistantCall && !seenCalls[message.ToolCallID] {
+			continue
+		}
+		out = append(out, message)
+	}
+	return out
+}
+
+func estimateReplayGroupTokens(group []OpenAIMessage) int {
+	total := 0
+	for _, message := range group {
+		total += estimateOpenAIContentTokens(message.Content)
+		total += estimateApproxTokens(message.ToolCallID)
+		for _, call := range message.ToolCalls {
+			total += estimateApproxTokens(call.Function.Name)
+			total += estimateApproxTokens(call.Function.Arguments)
+		}
+	}
+	return total
 }
 
 // collectAncestorChain walks previous_response_id backwards, returning the
@@ -67,7 +149,6 @@ func collectAncestorChain(prev *ResponsesObject) []*ResponsesObject {
 		cursor = ancestor
 	}
 
-	// Reverse to oldest-first.
 	for i, j := 0, len(stack)-1; i < j; i, j = i+1, j-1 {
 		stack[i], stack[j] = stack[j], stack[i]
 	}
@@ -112,11 +193,11 @@ func joinTextParts(parts []ResponseContentPart) string {
 	if len(parts) == 0 {
 		return ""
 	}
-	out := ""
-	for _, p := range parts {
-		if p.Type == "output_text" || p.Type == "text" || p.Type == "input_text" {
-			out += p.Text
+	var out strings.Builder
+	for _, part := range parts {
+		if part.Type == "output_text" || part.Type == "text" || part.Type == "input_text" {
+			out.WriteString(part.Text)
 		}
 	}
-	return out
+	return out.String()
 }
