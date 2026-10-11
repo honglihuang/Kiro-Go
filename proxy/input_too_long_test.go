@@ -107,6 +107,9 @@ func TestResponsesReplayHistoryLeavesRoomForCompactedInput(t *testing.T) {
 // A deterministic request-size rejection cannot succeed on another endpoint.
 // Retrying it only multiplies latency and upstream load.
 func TestCallKiroAPIDoesNotFallbackOnContentLengthRejection(t *testing.T) {
+	if err := config.Init(filepath.Join(t.TempDir(), "config.json")); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
 	var hits atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hits.Add(1)
@@ -245,5 +248,52 @@ func TestOpenAIToKiroTruncatesOversizedCurrentCustomToolResult(t *testing.T) {
 	}
 	if len(result.Content) != 1 || !strings.Contains(result.Content[0].Text, "Tool output truncated") {
 		t.Fatalf("tool output truncation was not disclosed: %#v", result.Content)
+	}
+}
+
+// Once a tool result is followed by another user message it moves into Kiro
+// history and sanitizeKiroHistory flattens it into ordinary text. The minimum
+// recent-history count must not make one multi-megabyte entry untrimmable.
+func TestOpenAIToKiroTruncatesOversizedToolResultMovedIntoHistory(t *testing.T) {
+	call := ToolCall{ID: "call_historical_large", Type: "function"}
+	call.Function.Name = "exec"
+	call.Function.Arguments = `{"input":"read a large command output"}`
+	payload := OpenAIToKiro(&OpenAIRequest{
+		Model: "gpt-5.6-sol",
+		Messages: []OpenAIMessage{
+			{Role: "assistant", Content: "", ToolCalls: []ToolCall{call}},
+			{Role: "tool", ToolCallID: "call_historical_large", Content: strings.Repeat("historical tool output line\n", 120_000)},
+			{Role: "user", Content: "continue"},
+		},
+	}, false)
+
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	if len(encoded) > maxPayloadBytes {
+		t.Fatalf("payload remains oversized after history truncation: %d > %d", len(encoded), maxPayloadBytes)
+	}
+	historyTokenLimit := int(float64(getContextWindowSize("gpt-5.6-sol")) * payloadHistoryWindowShare)
+	if got := estimateKiroHistoryTokens(payload.ConversationState.History); got > historyTokenLimit {
+		t.Fatalf("history remains over token budget: %d > %d", got, historyTokenLimit)
+	}
+	if len(payload.ConversationState.History) == 0 {
+		t.Fatal("history structure must remain present")
+	}
+	var historyText strings.Builder
+	for _, entry := range payload.ConversationState.History {
+		if entry.UserInputMessage != nil {
+			historyText.WriteString(entry.UserInputMessage.Content)
+		}
+		if entry.AssistantResponseMessage != nil {
+			historyText.WriteString(entry.AssistantResponseMessage.Content)
+		}
+	}
+	if !strings.Contains(historyText.String(), "Earlier message content truncated") {
+		t.Fatal("history content truncation must be disclosed to the model")
+	}
+	if payload.ConversationState.CurrentMessage.UserInputMessage.Content != "continue" {
+		t.Fatalf("current user instruction was changed: %q", payload.ConversationState.CurrentMessage.UserInputMessage.Content)
 	}
 }
