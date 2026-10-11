@@ -212,3 +212,53 @@ func TestResponsesDoesNotRotateAccountsOnContentLengthRejection(t *testing.T) {
 		t.Fatalf("stream must not rotate accounts, body=%s", streamBody)
 	}
 }
+
+// Codex custom tool outputs can exceed a megabyte. They become structured
+// current-message toolResults, which the byte-level payload limiter must trim;
+// shortening only currentMessage.content leaves the oversized copy untouched.
+func TestOpenAIToKiroTruncatesOversizedCurrentCustomToolResult(t *testing.T) {
+	items := []map[string]interface{}{
+		{
+			"type":    "custom_tool_call",
+			"call_id": "call_large",
+			"name":    "exec",
+			"input":   "read a large command output",
+		},
+		{
+			"type":    "custom_tool_call_output",
+			"call_id": "call_large",
+			"output":  strings.Repeat("large tool output line\n", 80_000),
+		},
+	}
+	raw, err := json.Marshal(items)
+	if err != nil {
+		t.Fatalf("marshal input: %v", err)
+	}
+	messages, err := parseResponsesInput(raw)
+	if err != nil {
+		t.Fatalf("parse input: %v", err)
+	}
+	payload := OpenAIToKiro(&OpenAIRequest{
+		Model:    "gpt-5.6-terra",
+		Messages: messages,
+	}, false)
+
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	if len(encoded) > maxPayloadBytes {
+		t.Fatalf("payload remains oversized after truncation: %d > %d", len(encoded), maxPayloadBytes)
+	}
+	ctx := payload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext
+	if ctx == nil || len(ctx.ToolResults) != 1 {
+		t.Fatalf("expected one structured tool result, got %#v", ctx)
+	}
+	result := ctx.ToolResults[0]
+	if result.ToolUseID != "call_large" {
+		t.Fatalf("tool result pairing changed: %q", result.ToolUseID)
+	}
+	if len(result.Content) != 1 || !strings.Contains(result.Content[0].Text, "Tool output truncated") {
+		t.Fatalf("tool output truncation was not disclosed: %#v", result.Content)
+	}
+}
