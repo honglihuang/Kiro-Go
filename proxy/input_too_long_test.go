@@ -217,30 +217,15 @@ func TestResponsesDoesNotRotateAccountsOnContentLengthRejection(t *testing.T) {
 // current-message toolResults, which the byte-level payload limiter must trim;
 // shortening only currentMessage.content leaves the oversized copy untouched.
 func TestOpenAIToKiroTruncatesOversizedCurrentCustomToolResult(t *testing.T) {
-	items := []map[string]interface{}{
-		{
-			"type":    "custom_tool_call",
-			"call_id": "call_large",
-			"name":    "exec",
-			"input":   "read a large command output",
-		},
-		{
-			"type":    "custom_tool_call_output",
-			"call_id": "call_large",
-			"output":  strings.Repeat("large tool output line\n", 80_000),
-		},
-	}
-	raw, err := json.Marshal(items)
-	if err != nil {
-		t.Fatalf("marshal input: %v", err)
-	}
-	messages, err := parseResponsesInput(raw)
-	if err != nil {
-		t.Fatalf("parse input: %v", err)
-	}
+	call := ToolCall{ID: "call_large", Type: "function"}
+	call.Function.Name = "exec"
+	call.Function.Arguments = `{"input":"read a large command output"}`
 	payload := OpenAIToKiro(&OpenAIRequest{
-		Model:    "gpt-5.6-terra",
-		Messages: messages,
+		Model: "gpt-5.6-terra",
+		Messages: []OpenAIMessage{
+			{Role: "assistant", Content: "", ToolCalls: []ToolCall{call}},
+			{Role: "tool", ToolCallID: "call_large", Content: strings.Repeat("large tool output line\n", 80_000)},
+		},
 	}, false)
 
 	encoded, err := json.Marshal(payload)
