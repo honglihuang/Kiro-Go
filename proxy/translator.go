@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 )
@@ -59,6 +60,10 @@ const maxPayloadBytes = 900 * 1024
 // truncationPlaceholder is inserted in history where older turns were dropped to
 // fit within maxPayloadBytes.
 const truncationPlaceholder = "[Earlier conversation history was truncated to fit the model's input limit. Older messages and tool activity have been omitted.]"
+
+// toolResultTruncationMarker makes lossy tool-output trimming explicit while
+// preserving the result's head, tail, call ID, and structured pairing.
+const toolResultTruncationMarker = "\n...[Tool output truncated to fit the model input limit]...\n"
 
 // minRecentHistoryTurns is the number of most-recent history entries always kept
 // (in addition to system priming and the active tool turn) when truncating.
@@ -1789,7 +1794,14 @@ func truncatePayloadToLimit(payload *KiroPayload, hasPriming bool) {
 	rebuilt = append(rebuilt, tail...)
 	payload.ConversationState.History = rebuilt
 
-	// If still too large (current message or retained tail alone exceeds the
+	// Structured current tool results are outside current-message content and
+	// can dominate the payload (Codex exec output commonly exceeds 1 MB). Trim
+	// their text first so the user's current instruction remains intact.
+	if payloadByteSize(payload) > maxPayloadBytes {
+		truncateCurrentToolResults(payload)
+	}
+
+	// If still too large (current message or tool schemas alone exceed the
 	// limit), shrink the current message content as a last resort.
 	if payloadByteSize(payload) > maxPayloadBytes {
 		truncateCurrentMessage(payload)
@@ -1826,6 +1838,83 @@ func payloadByteSize(payload *KiroPayload) int {
 
 func currentMessageModelID(payload *KiroPayload) string {
 	return payload.ConversationState.CurrentMessage.UserInputMessage.ModelID
+}
+
+// truncateCurrentToolResults reduces the largest structured tool outputs until
+// the serialized request fits. Re-measuring the complete JSON after each cut
+// accounts for escaping overhead and keeps this guard correct for arbitrary
+// tool output. IDs and result ordering are never changed.
+func truncateCurrentToolResults(payload *KiroPayload) {
+	if payload == nil {
+		return
+	}
+	ctx := payload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext
+	if ctx == nil || len(ctx.ToolResults) == 0 {
+		return
+	}
+
+	for {
+		currentSize := payloadByteSize(payload)
+		if currentSize <= maxPayloadBytes {
+			return
+		}
+
+		resultIndex, contentIndex, largestBytes := -1, -1, 0
+		for i := range ctx.ToolResults {
+			for j := range ctx.ToolResults[i].Content {
+				if size := len(ctx.ToolResults[i].Content[j].Text); size > largestBytes {
+					resultIndex, contentIndex, largestBytes = i, j, size
+				}
+			}
+		}
+		if resultIndex < 0 || largestBytes <= len(toolResultTruncationMarker) {
+			return
+		}
+
+		excess := currentSize - maxPayloadBytes
+		targetBytes := largestBytes - excess - 256
+		if targetBytes < len(toolResultTruncationMarker) {
+			targetBytes = len(toolResultTruncationMarker)
+		}
+		if targetBytes >= largestBytes {
+			targetBytes = largestBytes - 1
+		}
+
+		content := &ctx.ToolResults[resultIndex].Content[contentIndex]
+		trimmed := truncateToolResultText(content.Text, targetBytes)
+		if len(trimmed) >= len(content.Text) {
+			trimmed = toolResultTruncationMarker
+		}
+		content.Text = trimmed
+	}
+}
+
+// truncateToolResultText preserves both ends of tool output because command
+// failures and summaries often appear at the tail. Cuts always start on UTF-8
+// rune boundaries.
+func truncateToolResultText(text string, maxBytes int) string {
+	if len(text) <= maxBytes {
+		return text
+	}
+	if maxBytes <= len(toolResultTruncationMarker) {
+		end := min(maxBytes, len(toolResultTruncationMarker))
+		for end > 0 && !utf8.ValidString(toolResultTruncationMarker[:end]) {
+			end--
+		}
+		return toolResultTruncationMarker[:end]
+	}
+
+	remaining := maxBytes - len(toolResultTruncationMarker)
+	headBytes := remaining * 2 / 3
+	for headBytes > 0 && !utf8.ValidString(text[:headBytes]) {
+		headBytes--
+	}
+	tailBytes := remaining - headBytes
+	tailStart := len(text) - tailBytes
+	for tailStart < len(text) && !utf8.RuneStart(text[tailStart]) {
+		tailStart++
+	}
+	return text[:headBytes] + toolResultTruncationMarker + text[tailStart:]
 }
 
 // truncateCurrentMessage hard-truncates the current message content as a last
